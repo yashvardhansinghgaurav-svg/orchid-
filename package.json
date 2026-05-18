@@ -13,6 +13,7 @@
     "dev:all": "concurrently -n server,client -c cyan,magenta \"npm --prefix server run dev\" \"npm run dev:client\""
   },
   "dependencies": {
+    "framer-motion": "^12.38.0",
     "lucide-react": "^1.16.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
