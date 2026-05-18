@@ -81,6 +81,15 @@ const geminiRotationKeys = [
 ].filter((key) => typeof key === 'string' && key.trim().length > 0);
 let geminiRotationIndex = 0;
 
+const GEMINI_KEY_PER_MIN = Number.parseInt(process.env.GEMINI_KEY_PER_MIN || '3', 10);
+const GEMINI_KEY_PER_DAY = Number.parseInt(process.env.GEMINI_KEY_PER_DAY || '1500', 10);
+const geminiKeyQuota = geminiRotationKeys.map(() => ({
+  minuteWindowStart: Date.now(),
+  minuteCount: 0,
+  dayWindowStart: Date.now(),
+  dayCount: 0,
+}));
+
 const cleanText = (v) => (typeof v === 'string' ? v.trim() : '');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -132,13 +141,21 @@ function consumeProviderQuota(p) {
 }
 
 function quotaSnapshot() {
-  return Object.keys(PROVIDER_LIMITS).reduce((acc, p) => {
+  const snapshot = Object.keys(PROVIDER_LIMITS).reduce((acc, p) => {
     refreshQuotaWindow(p);
     const q = quotaState[p];
     const l = PROVIDER_LIMITS[p];
     acc[p] = { minute: `${q.minuteCount}/${l.perMinute}`, day: `${q.dayCount}/${l.perDay}`, available: canUseProvider(p) };
     return acc;
   }, {});
+  if (geminiRotationKeys.length > 0) {
+    snapshot.geminiRotatingKeys = geminiKeyQuota.map((q, i) => {
+      refreshKeyQuota(i);
+      return { key: i, minute: `${q.minuteCount}/${GEMINI_KEY_PER_MIN}`, day: `${q.dayCount}/${GEMINI_KEY_PER_DAY}`, available: canUseKey(i) };
+    });
+    snapshot.geminiRotatingActiveIndex = geminiRotationIndex;
+  }
+  return snapshot;
 }
 
 function enforceProviderQuota(provider) {
@@ -193,6 +210,37 @@ function rotateGeminiKey() {
   if (!geminiRotationKeys.length) return;
   geminiRotationIndex = (geminiRotationIndex + 1) % geminiRotationKeys.length;
   console.warn(`🔄 Gemini key rotated to index ${geminiRotationIndex}`);
+}
+
+function refreshKeyQuota(idx) {
+  const now = Date.now();
+  const q = geminiKeyQuota[idx];
+  if (!q) return;
+  if (now - q.minuteWindowStart >= 60000) { q.minuteWindowStart = now; q.minuteCount = 0; }
+  if (now - q.dayWindowStart >= 86400000) { q.dayWindowStart = now; q.dayCount = 0; }
+}
+
+function canUseKey(idx) {
+  refreshKeyQuota(idx);
+  const q = geminiKeyQuota[idx];
+  if (!q) return false;
+  return q.minuteCount < GEMINI_KEY_PER_MIN && q.dayCount < GEMINI_KEY_PER_DAY;
+}
+
+function consumeKeyQuota(idx) {
+  refreshKeyQuota(idx);
+  const q = geminiKeyQuota[idx];
+  if (!q) return;
+  q.minuteCount += 1;
+  q.dayCount += 1;
+}
+
+function findAvailableKeyIndex() {
+  for (let i = 0; i < geminiRotationKeys.length; i++) {
+    const idx = (geminiRotationIndex + i) % geminiRotationKeys.length;
+    if (canUseKey(idx)) return idx;
+  }
+  return -1;
 }
 
 function isGeminiQuotaError(error) {
@@ -336,20 +384,39 @@ async function callGemini({ prompt, messages, reasoningEffort }) {
 }
 
 async function callGeminiRotating({ prompt, messages, reasoningEffort }) {
-  enforceProviderQuota('gemini');
   if (!geminiRotationKeys.length) {
     throw createError('No Gemini rotation keys configured. Set PRIMARY_GEMINI_KEY/BACKUP keys in server/.env');
   }
 
   const reasoning = resolveReasoningConfig(reasoningEffort);
   const compiledPrompt = compileConversationPrompt(messages, prompt);
-  let attempts = 0;
   let lastError = null;
+  let triedKeys = 0;
 
-  while (attempts < geminiRotationKeys.length) {
-    const activeKey = geminiRotationKeys[geminiRotationIndex];
+  while (triedKeys < geminiRotationKeys.length) {
+    let keyIdx = findAvailableKeyIndex();
+
+    if (keyIdx === -1) {
+      console.warn('⏳ All Gemini rotation keys are at per-minute limit, waiting for quota reset...');
+      const waitTimes = geminiKeyQuota.map((q) => Math.max(0, 60000 - (Date.now() - q.minuteWindowStart)));
+      const minWait = Math.min(...waitTimes);
+      if (minWait > 0 && minWait <= 60000) {
+        await sleep(minWait + 500);
+      }
+      keyIdx = findAvailableKeyIndex();
+      if (keyIdx === -1) {
+        throw createError(
+          `All rotating Gemini keys are exhausted (daily limit). ${cleanText(lastError?.message || '')}`.trim(),
+          429,
+        );
+      }
+    }
+
+    geminiRotationIndex = keyIdx;
+    const activeKey = geminiRotationKeys[keyIdx];
 
     try {
+      consumeKeyQuota(keyIdx);
       const ai = new GoogleGenAI({ apiKey: activeKey });
       const response = await ai.models.generateContent({
         model: GEMINI_ROTATION_MODEL,
@@ -363,20 +430,24 @@ async function callGeminiRotating({ prompt, messages, reasoningEffort }) {
 
       const text = cleanText(response?.text || '');
       const parsed = parseLayeredText(text);
+      rotateGeminiKey();
       return {
         provider: 'gemini',
         engine: MODEL_MAP.geminirotating.label,
         model: GEMINI_ROTATION_MODEL,
         grounded: true,
         groundingMetadata: null,
-        route: ['gemini-rotating', `key-${geminiRotationIndex}`],
+        route: ['gemini-rotating', `key-${keyIdx}`],
         ...parsed,
       };
     } catch (error) {
       lastError = error;
       if (isGeminiQuotaError(error)) {
+        console.warn(`🔑 Key ${keyIdx} hit rate limit, marking exhausted and trying next key`);
+        const q = geminiKeyQuota[keyIdx];
+        if (q) q.minuteCount = GEMINI_KEY_PER_MIN;
         rotateGeminiKey();
-        attempts += 1;
+        triedKeys += 1;
         continue;
       }
       throw error;
